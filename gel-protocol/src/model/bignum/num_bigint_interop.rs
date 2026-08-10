@@ -93,15 +93,24 @@ mod test {
 mod test_with_decimal {
     use super::super::test_helpers::gen_i64;
     use super::BigInt;
+    use bigdecimal::num_bigint::ToBigInt;
     use bigdecimal::BigDecimal;
-    use num_bigint::ToBigInt;
     use rand::{rngs::StdRng, Rng, SeedableRng};
     use std::convert::TryFrom;
     use std::str::FromStr;
 
+    fn decimal_to_bigint(decimal: &BigDecimal) -> num_bigint::BigInt {
+        decimal
+            .to_bigint()
+            .expect("can convert to big int")
+            .to_string()
+            .parse()
+            .expect("can convert between num-bigint versions")
+    }
+
     #[test]
     fn bigint_conversion() -> Result<(), Box<dyn std::error::Error>> {
-        let x = BigInt::try_from(BigDecimal::from_str("1e20")?.to_bigint().unwrap())?;
+        let x = BigInt::try_from(decimal_to_bigint(&BigDecimal::from_str("1e20")?))?;
         assert_eq!(x.weight, 5);
         assert_eq!(x.digits, &[1]);
         Ok(())
@@ -109,7 +118,7 @@ mod test_with_decimal {
 
     fn int_roundtrip(s: &str) -> num_bigint::BigInt {
         let decimal = BigDecimal::from_str(s).expect("can parse decimal");
-        let rust = decimal.to_bigint().expect("can convert to big int");
+        let rust = decimal_to_bigint(&decimal);
         let edgedb = BigInt::try_from(rust).expect("can convert for edgedb");
         num_bigint::BigInt::from(edgedb)
     }
