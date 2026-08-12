@@ -4,6 +4,11 @@ use std::{future::Future, str::FromStr, task::Poll};
 
 use crate::{MaybeResolvedTarget, ResolvedTarget, TargetName, TcpResolve};
 
+#[cfg(feature = "hickory")]
+fn net_error(err: hickory_resolver::net::NetError) -> std::io::Error {
+    std::io::Error::other(err)
+}
+
 /// An async resolver for hostnames to IP addresses.
 #[derive(Clone)]
 pub struct Resolver {
@@ -31,7 +36,16 @@ impl Resolver {
     pub fn new() -> Result<Self, std::io::Error> {
         Ok(Self {
             #[cfg(feature = "hickory")]
-            resolver: hickory_resolver::Resolver::builder_tokio()?.build().into(),
+            resolver: {
+                let mut builder = hickory_resolver::Resolver::builder_tokio().map_err(net_error)?;
+                // hickory 0.26 changed the default lookup strategy to `Ipv6AndIpv4`, which
+                // returns IPv6 addresses first. We only use the first resolved address and do
+                // not fall back to the next, so preserve the pre-0.26 `Ipv4thenIpv6` behavior
+                // to avoid breaking IPv4-only listeners (e.g. a local server bound to 127.0.0.1).
+                builder.options_mut().ip_strategy =
+                    hickory_resolver::config::LookupIpStrategy::Ipv4thenIpv6;
+                builder.build().map_err(net_error)?.into()
+            },
         })
     }
 
@@ -56,7 +70,7 @@ impl Resolver {
                         let port = *port;
                         ResolveResult::new_async(async move {
                             let f = resolver.lookup_ip(host);
-                            let Some(addr) = f.await?.iter().next() else {
+                            let Some(addr) = f.await.map_err(net_error)?.iter().next() else {
                                 return Err(std::io::Error::new(
                                     std::io::ErrorKind::NotFound,
                                     "No address found",
