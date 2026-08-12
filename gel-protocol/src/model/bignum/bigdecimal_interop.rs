@@ -11,9 +11,9 @@ impl std::convert::TryFrom<bigdecimal::BigDecimal> for Decimal {
         let mut digits = Vec::new();
         let (v, scale) = dec.into_bigint_and_exponent();
         let (negative, mut val) = match v.sign() {
-            num_bigint::Sign::Minus => (true, -v),
-            num_bigint::Sign::NoSign => (false, v),
-            num_bigint::Sign::Plus => (false, v),
+            bigdecimal::num_bigint::Sign::Minus => (true, -v),
+            bigdecimal::num_bigint::Sign::NoSign => (false, v),
+            bigdecimal::num_bigint::Sign::Plus => (false, v),
         };
         let scale_4digits = if scale < 0 { scale / 4 } else { scale / 4 + 1 };
         let pad = scale_4digits * 4 - scale;
@@ -51,8 +51,8 @@ impl From<Decimal> for bigdecimal::BigDecimal {
 
 impl From<&Decimal> for bigdecimal::BigDecimal {
     fn from(val: &Decimal) -> bigdecimal::BigDecimal {
+        use bigdecimal::num_bigint::BigInt;
         use bigdecimal::BigDecimal;
-        use num_bigint::BigInt;
         use num_traits::pow;
         use std::cmp::max;
         if val.digits.is_empty() {
