@@ -9,26 +9,48 @@ fn net_error(err: hickory_resolver::net::NetError) -> std::io::Error {
     std::io::Error::other(err)
 }
 
-/// An async resolver for hostnames to IP addresses.
-#[derive(Clone)]
-pub struct Resolver {
-    #[cfg(feature = "hickory")]
-    resolver: std::sync::Arc<hickory_resolver::TokioResolver>,
+#[cfg(feature = "hickory")]
+fn build_hickory_resolver() -> Result<hickory_resolver::TokioResolver, std::io::Error> {
+    let mut builder = hickory_resolver::Resolver::builder_tokio().map_err(net_error)?;
+    // hickory 0.26 changed the default lookup strategy to `Ipv6AndIpv4`, which
+    // returns IPv6 addresses first. We only use the first resolved address and do
+    // not fall back to the next, so preserve the pre-0.26 `Ipv4thenIpv6` behavior
+    // to avoid breaking IPv4-only listeners (e.g. a local server bound to 127.0.0.1).
+    builder.options_mut().ip_strategy = hickory_resolver::config::LookupIpStrategy::Ipv4thenIpv6;
+    builder.build().map_err(net_error)
 }
 
 #[cfg(feature = "tokio")]
-#[allow(unused)]
-async fn resolve_host_to_socket_addrs(host: String) -> std::io::Result<ResolvedTarget> {
-    let res = tokio::task::spawn_blocking(move || format!("{host}:0").to_socket_addrs())
+fn select_preferred_socket_addr(
+    addrs: impl Iterator<Item = SocketAddr>,
+) -> std::io::Result<ResolvedTarget> {
+    let mut first = None;
+    for addr in addrs {
+        if addr.is_ipv4() {
+            return Ok(ResolvedTarget::SocketAddr(addr));
+        }
+        if first.is_none() {
+            first = Some(addr);
+        }
+    }
+    first
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "No address found"))
+        .map(ResolvedTarget::SocketAddr)
+}
+
+#[cfg(feature = "tokio")]
+async fn resolve_host_to_socket_addrs(host: String, port: u16) -> std::io::Result<ResolvedTarget> {
+    let res = tokio::task::spawn_blocking(move || (host.as_str(), port).to_socket_addrs())
         .await
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Interrupted, e.to_string()))??;
-    res.into_iter()
-        .next()
-        .ok_or(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "No address found",
-        ))
-        .map(ResolvedTarget::SocketAddr)
+    select_preferred_socket_addr(res)
+}
+
+/// An async resolver for hostnames to IP addresses.
+#[derive(Clone, Default)]
+pub struct Resolver {
+    #[cfg(feature = "hickory")]
+    resolver: std::sync::Arc<std::sync::OnceLock<Option<hickory_resolver::TokioResolver>>>,
 }
 
 impl Resolver {
@@ -36,16 +58,7 @@ impl Resolver {
     pub fn new() -> Result<Self, std::io::Error> {
         Ok(Self {
             #[cfg(feature = "hickory")]
-            resolver: {
-                let mut builder = hickory_resolver::Resolver::builder_tokio().map_err(net_error)?;
-                // hickory 0.26 changed the default lookup strategy to `Ipv6AndIpv4`, which
-                // returns IPv6 addresses first. We only use the first resolved address and do
-                // not fall back to the next, so preserve the pre-0.26 `Ipv4thenIpv6` behavior
-                // to avoid breaking IPv4-only listeners (e.g. a local server bound to 127.0.0.1).
-                builder.options_mut().ip_strategy =
-                    hickory_resolver::config::LookupIpStrategy::Ipv4thenIpv6;
-                builder.build().map_err(net_error)?.into()
-            },
+            resolver: std::sync::Arc::new(std::sync::OnceLock::new()),
         })
     }
 
@@ -69,21 +82,28 @@ impl Resolver {
                         let host = host.to_string();
                         let port = *port;
                         ResolveResult::new_async(async move {
-                            let f = resolver.lookup_ip(host);
-                            let Some(addr) = f.await.map_err(net_error)?.iter().next() else {
-                                return Err(std::io::Error::new(
-                                    std::io::ErrorKind::NotFound,
-                                    "No address found",
-                                ));
-                            };
-                            Ok(ResolvedTarget::SocketAddr(SocketAddr::new(addr, port)))
+                            if let Some(resolver) =
+                                resolver.get_or_init(|| build_hickory_resolver().ok())
+                            {
+                                if let Ok(lookup) = resolver.lookup_ip(&host).await {
+                                    if let Some(addr) = lookup.iter().next() {
+                                        return Ok(ResolvedTarget::SocketAddr(SocketAddr::new(
+                                            addr, port,
+                                        )));
+                                    }
+                                }
+                            }
+                            resolve_host_to_socket_addrs(host, port).await
                         })
                     }
                     #[cfg(all(feature = "tokio", not(feature = "hickory")))]
                     {
-                        ResolveResult::new_async(resolve_host_to_socket_addrs(host.to_string()))
+                        ResolveResult::new_async(resolve_host_to_socket_addrs(
+                            host.to_string(),
+                            *port,
+                        ))
                     }
-                    #[cfg(not(any(feature = "tokio", feature = "hickory")))]
+                    #[cfg(not(feature = "tokio"))]
                     {
                         ResolveResult::new_sync(Err(std::io::Error::new(
                             std::io::ErrorKind::Unsupported,
@@ -225,6 +245,52 @@ mod tests {
     #[tokio::test]
     async fn test_resolve_remote() {
         let resolver = Resolver::new().unwrap();
+        let target = TargetName::new_tcp(("localhost", 8080));
+        let result = target.resolve(&resolver).await.unwrap();
+        assert_eq!(
+            result,
+            ResolvedTarget::SocketAddr(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+                8080
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_lazy_for_ip_and_unix() {
+        let resolver = Resolver::new().unwrap();
+        #[cfg(feature = "hickory")]
+        assert!(resolver.resolver.get().is_none());
+
+        let ip_target = TargetName::new_tcp(("127.0.0.1", 8080));
+        let result = ip_target.resolve(&resolver).await.unwrap();
+        assert_eq!(
+            result,
+            ResolvedTarget::SocketAddr(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+                8080
+            ))
+        );
+        #[cfg(feature = "hickory")]
+        assert!(resolver.resolver.get().is_none());
+
+        #[cfg(unix)]
+        {
+            let unix_target = TargetName::new_unix_path("/tmp/test.sock").unwrap();
+            let _ = unix_target.resolve(&resolver).await.unwrap();
+            #[cfg(feature = "hickory")]
+            assert!(resolver.resolver.get().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_resolve_fallback_when_hickory_unavailable() {
+        let resolver = Resolver::new().unwrap();
+        #[cfg(feature = "hickory")]
+        {
+            // Simulate missing/invalid /etc/resolv.conf by pre-populating OnceLock with None
+            let _ = resolver.resolver.set(None);
+        }
         let target = TargetName::new_tcp(("localhost", 8080));
         let result = target.resolve(&resolver).await.unwrap();
         assert_eq!(
