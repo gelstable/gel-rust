@@ -175,16 +175,27 @@ where
             "Transaction object must \
             be dropped by the time transaction body finishes.",
         );
-        match result {
+
+        // Commit or roll back the transaction
+        let result = match result {
             Ok(val) => {
                 log::debug!("Comitting transaction");
-                tran.commit().await?;
+                tran.commit().await
+                    .and_then(|()| Ok(val))
+            },
+            Err(e) => {
+                log::debug!("Rolling back transaction on error");
+                tran.rollback().await?;
+                Err(e)
+            },
+        };
+
+        // Decide if we need to retry or return
+        match result {
+            Ok(val) => {
                 return Ok(val);
             }
             Err(outer) => {
-                log::debug!("Rolling back transaction on error");
-                tran.rollback().await?;
-
                 let some_retry = outer.chain().find_map(|e| {
                     e.downcast_ref::<Error>().and_then(|e| {
                         if e.has_tag(SHOULD_RETRY) {
