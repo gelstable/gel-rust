@@ -20,7 +20,7 @@ fn build_hickory_resolver() -> Result<hickory_resolver::TokioResolver, std::io::
     builder.build().map_err(net_error)
 }
 
-#[cfg(any(feature = "tokio", feature = "hickory"))]
+#[cfg(feature = "tokio")]
 fn select_preferred_socket_addr(
     addrs: impl Iterator<Item = SocketAddr>,
 ) -> std::io::Result<ResolvedTarget> {
@@ -43,12 +43,6 @@ async fn resolve_host_to_socket_addrs(host: String, port: u16) -> std::io::Resul
     let res = tokio::task::spawn_blocking(move || (host.as_str(), port).to_socket_addrs())
         .await
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Interrupted, e.to_string()))??;
-    select_preferred_socket_addr(res)
-}
-
-#[cfg(all(feature = "hickory", not(feature = "tokio")))]
-async fn resolve_host_to_socket_addrs(host: String, port: u16) -> std::io::Result<ResolvedTarget> {
-    let res = (host.as_str(), port).to_socket_addrs()?;
     select_preferred_socket_addr(res)
 }
 
@@ -109,7 +103,7 @@ impl Resolver {
                             *port,
                         ))
                     }
-                    #[cfg(not(any(feature = "tokio", feature = "hickory")))]
+                    #[cfg(not(feature = "tokio"))]
                     {
                         ResolveResult::new_sync(Err(std::io::Error::new(
                             std::io::ErrorKind::Unsupported,
